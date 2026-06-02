@@ -63,6 +63,7 @@ fun ScreenRecorderMainScreen(
     val selectedPreset by viewModel.selectedPreset.collectAsStateWithLifecycle()
     val selectedFps by viewModel.selectedFps.collectAsStateWithLifecycle()
     val audioEnabled by viewModel.audioEnabled.collectAsStateWithLifecycle()
+    val floatingControlsEnabled by viewModel.floatingControlsEnabled.collectAsStateWithLifecycle()
     val trimState by viewModel.trimState.collectAsStateWithLifecycle()
 
     var recordingToTrim by remember { mutableStateOf<Recording?>(null) }
@@ -97,6 +98,14 @@ fun ScreenRecorderMainScreen(
             projectionLauncher.launch(captureIntent)
         } catch (e: Exception) {
             Toast.makeText(context, "Error starting capture helper: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    LaunchedEffect(activeState) {
+        val state = activeState
+        if (state is ScreenRecordService.ServiceState.Error) {
+            Toast.makeText(context, "Error: ${state.message}", Toast.LENGTH_LONG).show()
+            viewModel.clearActiveStateError()
         }
     }
 
@@ -244,7 +253,20 @@ fun ScreenRecorderMainScreen(
                         selectedFps = selectedFps,
                         onFpsSelected = { viewModel.selectFps(it) },
                         audioEnabled = audioEnabled,
-                        onAudioToggled = { viewModel.toggleAudioState(it) }
+                        onAudioToggled = { viewModel.toggleAudioState(it) },
+                        floatingControlsEnabled = floatingControlsEnabled,
+                        onFloatingControlsToggled = { enabled ->
+                            if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(context)) {
+                                val intent = Intent(
+                                    android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                                Toast.makeText(context, "Grant overlay drawing permission to display the floating control bar.", Toast.LENGTH_LONG).show()
+                            } else {
+                                viewModel.toggleFloatingControls(enabled)
+                            }
+                        }
                     )
                 }
             }
@@ -488,7 +510,9 @@ fun ConfigurationPanel(
     selectedFps: Int,
     onFpsSelected: (Int) -> Unit,
     audioEnabled: Boolean,
-    onAudioToggled: (Boolean) -> Unit
+    onAudioToggled: (Boolean) -> Unit,
+    floatingControlsEnabled: Boolean,
+    onFloatingControlsToggled: (Boolean) -> Unit
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -565,7 +589,7 @@ fun ConfigurationPanel(
             }
 
             Spacer(modifier = Modifier.height(16.dp))
-            Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             Spacer(modifier = Modifier.height(16.dp))
 
             // Row for FPS and Sound
@@ -592,6 +616,40 @@ fun ConfigurationPanel(
                     thumbContent = {
                         Icon(
                             imageVector = if (audioEnabled) Icons.Filled.Mic else Icons.Filled.MicOff,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Floating Controls Toggle Option
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1.1f)) {
+                    Text(
+                        text = "Floating Controls Overlay",
+                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                    )
+                    Text(
+                        text = "Show responsive mini control pill over other apps",
+                        style = MaterialTheme.typography.bodySmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    )
+                }
+
+                Switch(
+                    checked = floatingControlsEnabled,
+                    onCheckedChange = onFloatingControlsToggled,
+                    thumbContent = {
+                        Icon(
+                            imageVector = if (floatingControlsEnabled) Icons.Filled.FeaturedVideo else Icons.Outlined.FeaturedVideo,
                             contentDescription = null,
                             modifier = Modifier.size(16.dp)
                         )
@@ -804,7 +862,7 @@ fun RecordingGalleryItem(
             }
 
             Spacer(modifier = Modifier.height(16.dp))
-            Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
             Spacer(modifier = Modifier.height(10.dp))
 
             // Action Row

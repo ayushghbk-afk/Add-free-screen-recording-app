@@ -48,6 +48,12 @@ class ScreenRecordService : Service() {
     private var audioEnabled = true
     private var dpi = 240
 
+    // Window manager for floating controller overlay
+    private var windowManager: android.view.WindowManager? = null
+    private var floatingView: android.view.View? = null
+    private var floatingCountTextView: android.widget.TextView? = null
+    private var floatingControlsEnabled = false
+
     override fun onCreate() {
         super.onCreate()
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -59,6 +65,11 @@ class ScreenRecordService : Service() {
         val action = intent.action
         if (action == ACTION_STOP) {
             stopRecordingAndSave()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (action == ACTION_DISCARD) {
+            discardRecording()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -87,6 +98,7 @@ class ScreenRecordService : Service() {
         bitrate = intent.getIntExtra(EXTRA_BITRATE, 5000000)
         audioEnabled = intent.getBooleanExtra(EXTRA_AUDIO, true)
         dpi = intent.getIntExtra(EXTRA_DPI, 240)
+        floatingControlsEnabled = intent.getBooleanExtra(EXTRA_FLOATING_CONTROLS, false)
 
         if (resultCode != Activity.RESULT_OK || resultData == null) {
             Log.e(TAG, "Invalid result code or null intent data. Stopping service.")
@@ -95,13 +107,43 @@ class ScreenRecordService : Service() {
             return START_NOT_STICKY
         }
 
-        // 3. Start recording actual media
+        // 3. STRICT REQUIREMENT on Android 14+: Retrieve the MediaProjection object synchronously
+        // inside onStartCommand BEFORE it returns. Doing it inside an async coroutine throws SecurityException!
+        try {
+            mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, resultData)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed secure projection acquisition on Android 14+", e)
+            _recordingState.value = ServiceState.Error("Failed to initiate media screen projection: ${e.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (mediaProjection == null) {
+            Log.e(TAG, "Failed to create MediaProjection.")
+            _recordingState.value = ServiceState.Error("Failed to establish screen projection session.")
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        // 4. Mandatory for Android 14 (API 34) and higher: You must register a callback
+        // before invoking createVirtualDisplay(), otherwise a SecurityException will be thrown.
+        mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.d(TAG, "MediaProjection session stopped automatically.")
+                serviceScope.launch {
+                    stopRecordingAndSave()
+                    stopSelf()
+                }
+            }
+        }, android.os.Handler(android.os.Looper.getMainLooper()))
+
+        // 5. Start recording actual media
         serviceScope.launch {
             try {
-                startRecording(resultCode, resultData)
+                startRecording()
             } catch (e: Exception) {
                 Log.e(TAG, "Failed or crashed starting recording", e)
-                _recordingState.value = ServiceState.Error("Error initializing: ${e.message}")
+                _recordingState.value = ServiceState.Error("Error starting recording: ${e.message}")
                 stopSelf()
             }
         }
@@ -109,7 +151,7 @@ class ScreenRecordService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun startRecording(resultCode: Int, resultData: Intent) {
+    private fun startRecording() {
         val moviesDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
         if (!moviesDir.exists()) {
             moviesDir.mkdirs()
@@ -120,6 +162,13 @@ class ScreenRecordService : Service() {
         val file = File(moviesDir, fileName)
         currentFile = file
 
+        // Securely check for microphone permission to avoid crashes on emulators or permissions mismatch
+        val hasAudioPermission = ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val useAudio = audioEnabled && hasAudioPermission
+
         // Create MediaRecorder
         @Suppress("DEPRECATION")
         mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -129,17 +178,17 @@ class ScreenRecordService : Service() {
         }
 
         mediaRecorder?.apply {
-            if (audioEnabled) {
+            if (useAudio) {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
             }
             setVideoSource(MediaRecorder.VideoSource.SURFACE)
             setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             setOutputFile(file.absolutePath)
 
-            // Video specs
+            // Video specs - standardized to multiple of 16 inside ViewModel
             setVideoSize(targetWidth, targetHeight)
             setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-            if (audioEnabled) {
+            if (useAudio) {
                 setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
                 setAudioSamplingRate(44100)
                 setAudioEncodingBitRate(128000)
@@ -148,12 +197,6 @@ class ScreenRecordService : Service() {
             setVideoFrameRate(fps)
 
             prepare()
-        }
-
-        // MediaProjection
-        mediaProjection = mediaProjectionManager?.getMediaProjection(resultCode, resultData)
-        if (mediaProjection == null) {
-            throw IllegalStateException("Failed to create MediaProjection.")
         }
 
         // VirtualDisplay
@@ -174,10 +217,16 @@ class ScreenRecordService : Service() {
 
         // Start timer
         startTimer()
+
+        // Display overlay controller if enabled
+        if (floatingControlsEnabled) {
+            showFloatingControls()
+        }
     }
 
     private fun stopRecordingAndSave() {
         timerJob?.cancel()
+        hideFloatingControls()
         
         val recordTime = System.currentTimeMillis() - startTimestampSec
         durationMs = if (recordTime > 0) recordTime else 0
@@ -243,6 +292,8 @@ class ScreenRecordService : Service() {
                 val elapsedStr = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
                 _recordingState.value = ServiceState.Recording(elapsed, elapsedStr, currentFile?.absolutePath ?: "")
                 updateNotification(elapsedStr)
+                // Dynamically update elapsed duration text inside overlay
+                floatingCountTextView?.text = elapsedStr
             }
         }
     }
@@ -263,6 +314,17 @@ class ScreenRecordService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        // Added Discard Action: allow user to end recording and delete files directly from notifications
+        val discardIntent = Intent(this, ScreenRecordService::class.java).apply {
+            action = ACTION_DISCARD
+        }
+        val discardPendingIntent = PendingIntent.getService(
+            this,
+            2,
+            discardIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         // Launch app on click
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val launchPendingIntent = PendingIntent.getActivity(
@@ -272,13 +334,17 @@ class ScreenRecordService : Service() {
             PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val soundTypeStr = if (audioEnabled) "Mic Audio On" else "Muted"
+        val formatStr = "${targetWidth}x${targetHeight} @ ${fps}FPS"
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Recording Active")
-            .setContentText("Duration: $timeText")
-            .setSmallIcon(android.R.drawable.presence_video_online)
+            .setContentText("Duration: $timeText  •  $soundTypeStr  •  $formatStr")
+            .setSmallIcon(com.example.R.drawable.ic_launcher_foreground)
             .setOngoing(true)
             .setContentIntent(launchPendingIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Stop Recording", stopPendingIntent)
+            .addAction(android.R.drawable.ic_media_pause, "Save", stopPendingIntent)
+            .addAction(android.R.drawable.ic_menu_delete, "Discard", discardPendingIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -300,10 +366,207 @@ class ScreenRecordService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        hideFloatingControls()
         serviceJob.cancel()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun dpToPx(dp: Int): Int {
+        return (dp * resources.displayMetrics.density).toInt()
+    }
+
+    private fun showFloatingControls() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !android.provider.Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "Floating control permission NOT granted.")
+            return
+        }
+
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+
+        // Create main container view (LinearLayout)
+        val container = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            
+            // Nice padding & background (dark translucent slate rounded card)
+            setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
+            
+            val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#1B1E21")) // Midnight Slate background
+                cornerRadius = dpToPx(24).toFloat()
+                setStroke(dpToPx(1), android.graphics.Color.parseColor("#343A40")) // Border tint
+            }
+            background = backgroundDrawable
+        }
+
+        // 1. Blinking red recording indicator dot
+        val dotView = android.view.View(this).apply {
+            val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(10), dpToPx(10)).apply {
+                rightMargin = dpToPx(10)
+            }
+            this.layoutParams = layoutParams
+            
+            val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.RED)
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+            }
+            background = dotDrawable
+        }
+        
+        // Add subtle indicator breathing animation programmatically
+        val anim = android.view.animation.AlphaAnimation(0.2f, 1.0f).apply {
+            duration = 600
+            repeatMode = android.view.animation.Animation.REVERSE
+            repeatCount = android.view.animation.Animation.INFINITE
+        }
+        dotView.startAnimation(anim)
+        container.addView(dotView)
+
+        // 2. Elapsed Duration text
+        floatingCountTextView = android.widget.TextView(this).apply {
+            text = "00:00"
+            setTextColor(android.graphics.Color.WHITE)
+            textSize = 14f
+            setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+            val layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply {
+                rightMargin = dpToPx(14)
+            }
+            this.layoutParams = layoutParams
+        }
+        container.addView(floatingCountTextView)
+
+        // 3. Spacing / Divider
+        val dividerView = android.view.View(this).apply {
+            val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(1), dpToPx(16)).apply {
+                rightMargin = dpToPx(14)
+            }
+            this.layoutParams = layoutParams
+            setBackgroundColor(android.graphics.Color.parseColor("#495057"))
+        }
+        container.addView(dividerView)
+
+        // 4. STOP Button (Action)
+        val stopBtn = android.widget.TextView(this).apply {
+            text = "STOP"
+            setTextColor(android.graphics.Color.parseColor("#FF5252")) // Modern red text
+            textSize = 13f
+            setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+            setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
+            
+            // Slight clickable indication
+            isClickable = true
+            isFocusable = true
+            
+            setOnClickListener {
+                Log.d(TAG, "Floating Stop button clicked - terminating recording.")
+                stopRecordingAndSave()
+                stopSelf()
+            }
+        }
+        container.addView(stopBtn)
+
+        // Setup WindowManager LayoutParams
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            android.view.WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val params = android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+            android.view.WindowManager.LayoutParams.WRAP_CONTENT,
+            type,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = android.view.Gravity.TOP or android.view.Gravity.CENTER_HORIZONTAL
+            x = 0
+            y = 200 // Position it slightly below status bar in safe zone
+        }
+
+        // Add Draggability Support to container
+        container.setOnTouchListener(object : android.view.View.OnTouchListener {
+            private var initialX = 0
+            private var initialY = 0
+            private var initialTouchX = 0f
+            private var initialTouchY = 0f
+            private var isDragging = false
+
+            override fun onTouch(view: android.view.View, event: android.view.MotionEvent): Boolean {
+                when (event.action) {
+                    android.view.MotionEvent.ACTION_DOWN -> {
+                        initialX = params.x
+                        initialY = params.y
+                        initialTouchX = event.rawX
+                        initialTouchY = event.rawY
+                        isDragging = false
+                        return true
+                    }
+                    android.view.MotionEvent.ACTION_MOVE -> {
+                        val diffX = event.rawX - initialTouchX
+                        val diffY = event.rawY - initialTouchY
+                        if (Math.abs(diffX) > 10 || Math.abs(diffY) > 10 || isDragging) {
+                            isDragging = true
+                            params.x = (initialX + diffX).toInt()
+                            params.y = (initialY + diffY).toInt()
+                            windowManager?.updateViewLayout(container, params)
+                        }
+                        return true
+                    }
+                    android.view.MotionEvent.ACTION_UP -> {
+                        return true
+                    }
+                }
+                return false
+            }
+        })
+
+        floatingView = container
+        try {
+            windowManager?.addView(container, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding overlay floatingView", e)
+        }
+    }
+
+    private fun hideFloatingControls() {
+        if (floatingView != null && windowManager != null) {
+            try {
+                windowManager?.removeView(floatingView)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing floatingView", e)
+            } finally {
+                floatingView = null
+                floatingCountTextView = null
+            }
+        }
+    }
+
+    private fun discardRecording() {
+        timerJob?.cancel()
+        hideFloatingControls()
+        try {
+            mediaRecorder?.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping MediaRecorder on discard capture", e)
+        } finally {
+            mediaRecorder?.release()
+            mediaRecorder = null
+        }
+        virtualDisplay?.release()
+        virtualDisplay = null
+        mediaProjection?.stop()
+        mediaProjection = null
+        
+        currentFile?.delete()
+        currentFile = null
+        _recordingState.value = ServiceState.Idle
+    }
 
     sealed class ServiceState {
         object Idle : ServiceState()
@@ -317,6 +580,7 @@ class ScreenRecordService : Service() {
         private const val CHANNEL_ID = "screen_record_channel"
 
         const val ACTION_STOP = "com.example.service.STOP"
+        const val ACTION_DISCARD = "com.example.service.DISCARD"
         
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"
@@ -326,6 +590,7 @@ class ScreenRecordService : Service() {
         const val EXTRA_BITRATE = "bitrate"
         const val EXTRA_AUDIO = "audio"
         const val EXTRA_DPI = "dpi"
+        const val EXTRA_FLOATING_CONTROLS = "floating_controls"
 
         private val _recordingState = MutableStateFlow<ServiceState>(ServiceState.Idle)
         val recordingState: StateFlow<ServiceState> = _recordingState.asStateFlow()
@@ -339,7 +604,8 @@ class ScreenRecordService : Service() {
             dpi: Int,
             fps: Int,
             bitrate: Int,
-            audioEnabled: Boolean
+            audioEnabled: Boolean,
+            floatingControls: Boolean = false
         ) {
             val intent = Intent(context, ScreenRecordService::class.java).apply {
                 putExtra(EXTRA_RESULT_CODE, resultCode)
@@ -350,6 +616,7 @@ class ScreenRecordService : Service() {
                 putExtra(EXTRA_FPS, fps)
                 putExtra(EXTRA_BITRATE, bitrate)
                 putExtra(EXTRA_AUDIO, audioEnabled)
+                putExtra(EXTRA_FLOATING_CONTROLS, floatingControls)
             }
             ContextCompat.startForegroundService(context, intent)
         }
@@ -359,6 +626,12 @@ class ScreenRecordService : Service() {
                 action = ACTION_STOP
             }
             context.startService(intent)
+        }
+
+        fun clearError() {
+            if (_recordingState.value is ServiceState.Error) {
+                _recordingState.value = ServiceState.Idle
+            }
         }
     }
 }

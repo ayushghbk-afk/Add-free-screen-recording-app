@@ -35,6 +35,9 @@ class ScreenRecorderViewModel(private val repository: RecordingRepository) : Vie
     private val _audioEnabled = MutableStateFlow(true)
     val audioEnabled: StateFlow<Boolean> = _audioEnabled.asStateFlow()
 
+    private val _floatingControlsEnabled = MutableStateFlow(false) // Default to false to ensure permission is requested first
+    val floatingControlsEnabled: StateFlow<Boolean> = _floatingControlsEnabled.asStateFlow()
+
     // Recording status observer from service
     val activeRecordingState = ScreenRecordService.recordingState
 
@@ -61,6 +64,10 @@ class ScreenRecorderViewModel(private val repository: RecordingRepository) : Vie
         _audioEnabled.value = enabled
     }
 
+    fun toggleFloatingControls(enabled: Boolean) {
+        _floatingControlsEnabled.value = enabled
+    }
+
     fun startScreenRecorder(context: Context, resultCode: Int, data: android.content.Intent) {
         val displayMetrics = context.resources.displayMetrics
         val rawWidth = displayMetrics.widthPixels
@@ -69,16 +76,22 @@ class ScreenRecorderViewModel(private val repository: RecordingRepository) : Vie
 
         // Avoid stretching or invalid frame structures by matching the real aspect ratio:
         val aspect = rawHeight.toFloat() / rawWidth
-        val finalTargetWidth = _selectedPreset.value.targetWidthLimit
+        val selectedTargetWidth = _selectedPreset.value.targetWidthLimit
         
-        // Ensure even numbers (required by standard H264 video encoders)
+        // Ensure standard dimensions are multiple of 16 (strict H264 hardware encoder requirement on emulators & physical chips)
+        var finalTargetWidth = (selectedTargetWidth / 16) * 16
+        if (finalTargetWidth == 0) {
+            finalTargetWidth = 720
+        }
+        
         var finalTargetHeight = (finalTargetWidth * aspect).toInt()
-        if (finalTargetHeight % 2 != 0) {
-            finalTargetHeight += 1
+        finalTargetHeight = (finalTargetHeight / 16) * 16
+        if (finalTargetHeight == 0) {
+            finalTargetHeight = 1280
         }
 
         // Calculate HD Bitrate based on preset and FPS
-        val baseBitrate = when (finalTargetWidth) {
+        val baseBitrate = when (selectedTargetWidth) {
             1080 -> 12000000 // 12 Mbps
             720 -> 6000000   // 6 Mbps
             else -> 3000000  // 3 Mbps
@@ -97,8 +110,13 @@ class ScreenRecorderViewModel(private val repository: RecordingRepository) : Vie
             dpi = rawDpi,
             fps = _selectedFps.value,
             bitrate = finalBitrate,
-            audioEnabled = _audioEnabled.value
+            audioEnabled = _audioEnabled.value,
+            floatingControls = _floatingControlsEnabled.value
         )
+    }
+
+    fun clearActiveStateError() {
+        ScreenRecordService.clearError()
     }
 
     fun stopScreenRecorder(context: Context) {
