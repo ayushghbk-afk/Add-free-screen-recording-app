@@ -1,0 +1,6 @@
+{
+  "name": "Screen Recorder",
+  "description": "Record your screen in high-definition formats, trim recordings, and export them directly from the background.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
