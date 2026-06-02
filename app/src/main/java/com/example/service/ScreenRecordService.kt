@@ -54,6 +54,13 @@ class ScreenRecordService : Service() {
     private var floatingCountTextView: android.widget.TextView? = null
     private var floatingControlsEnabled = false
 
+    private var isExpanded = true
+    private var accumulatedDurationMs = 0L
+    private val idleHideHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val collapseRunnable = Runnable {
+        collapseFloatingControls()
+    }
+
     override fun onCreate() {
         super.onCreate()
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -71,6 +78,14 @@ class ScreenRecordService : Service() {
         if (action == ACTION_DISCARD) {
             discardRecording()
             stopSelf()
+            return START_NOT_STICKY
+        }
+        if (action == ACTION_PAUSE) {
+            pauseRecording()
+            return START_NOT_STICKY
+        }
+        if (action == ACTION_RESUME) {
+            resumeRecording()
             return START_NOT_STICKY
         }
 
@@ -213,6 +228,8 @@ class ScreenRecordService : Service() {
 
         mediaRecorder?.start()
         startTimestampSec = System.currentTimeMillis()
+        accumulatedDurationMs = 0L
+        isExpanded = true
         _recordingState.value = ServiceState.Recording(0, "00:00", file.absolutePath)
 
         // Start timer
@@ -221,6 +238,7 @@ class ScreenRecordService : Service() {
         // Display overlay controller if enabled
         if (floatingControlsEnabled) {
             showFloatingControls()
+            resetIdleTimer()
         }
     }
 
@@ -228,7 +246,11 @@ class ScreenRecordService : Service() {
         timerJob?.cancel()
         hideFloatingControls()
         
-        val recordTime = System.currentTimeMillis() - startTimestampSec
+        val recordTime = if (_recordingState.value is ServiceState.Paused) {
+            accumulatedDurationMs
+        } else {
+            accumulatedDurationMs + (System.currentTimeMillis() - startTimestampSec)
+        }
         durationMs = if (recordTime > 0) recordTime else 0
 
         try {
@@ -285,7 +307,8 @@ class ScreenRecordService : Service() {
         timerJob = serviceScope.launch {
             while (isActive) {
                 delay(1000)
-                val elapsed = System.currentTimeMillis() - startTimestampSec
+                val currentSegmentTime = System.currentTimeMillis() - startTimestampSec
+                val elapsed = accumulatedDurationMs + currentSegmentTime
                 val totalSecs = elapsed / 1000
                 val minutes = totalSecs / 60
                 val seconds = totalSecs % 60
@@ -337,17 +360,50 @@ class ScreenRecordService : Service() {
         val soundTypeStr = if (audioEnabled) "Mic Audio On" else "Muted"
         val formatStr = "${targetWidth}x${targetHeight} @ ${fps}FPS"
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Screen Recording Active")
+        val isNowPaused = _recordingState.value is ServiceState.Paused
+        val stateTitle = if (isNowPaused) "Screen Recording Paused" else "Screen Recording Active"
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(stateTitle)
             .setContentText("Duration: $timeText  •  $soundTypeStr  •  $formatStr")
             .setSmallIcon(com.example.R.drawable.ic_launcher_foreground)
             .setOngoing(true)
             .setContentIntent(launchPendingIntent)
-            .addAction(android.R.drawable.ic_media_pause, "Save", stopPendingIntent)
-            .addAction(android.R.drawable.ic_menu_delete, "Discard", discardPendingIntent)
             .setCategory(Notification.CATEGORY_SERVICE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+
+        // Add Pause or Resume action dynamically
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            if (isNowPaused) {
+                val resumeIntent = Intent(this, ScreenRecordService::class.java).apply {
+                    action = ACTION_RESUME
+                }
+                val resumePendingIntent = PendingIntent.getService(
+                    this,
+                    3,
+                    resumeIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(android.R.drawable.ic_media_play, "Resume", resumePendingIntent)
+            } else {
+                val pauseIntent = Intent(this, ScreenRecordService::class.java).apply {
+                    action = ACTION_PAUSE
+                }
+                val pausePendingIntent = PendingIntent.getService(
+                    this,
+                    4,
+                    pauseIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(android.R.drawable.ic_media_pause, "Pause", pausePendingIntent)
+            }
+        }
+
+        // Add standard Stop and Discard
+        builder.addAction(android.R.drawable.ic_media_pause, "Save", stopPendingIntent)
+        builder.addAction(android.R.drawable.ic_menu_delete, "Discard", discardPendingIntent)
+
+        return builder.build()
     }
 
     private fun createNotificationChannel() {
@@ -388,88 +444,9 @@ class ScreenRecordService : Service() {
         val container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.HORIZONTAL
             gravity = android.view.Gravity.CENTER_VERTICAL
-            
-            // Nice padding & background (dark translucent slate rounded card)
-            setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
-            
-            val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
-                setColor(android.graphics.Color.parseColor("#1B1E21")) // Midnight Slate background
-                cornerRadius = dpToPx(24).toFloat()
-                setStroke(dpToPx(1), android.graphics.Color.parseColor("#343A40")) // Border tint
-            }
-            background = backgroundDrawable
         }
 
-        // 1. Blinking red recording indicator dot
-        val dotView = android.view.View(this).apply {
-            val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(10), dpToPx(10)).apply {
-                rightMargin = dpToPx(10)
-            }
-            this.layoutParams = layoutParams
-            
-            val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
-                setColor(android.graphics.Color.RED)
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-            }
-            background = dotDrawable
-        }
-        
-        // Add subtle indicator breathing animation programmatically
-        val anim = android.view.animation.AlphaAnimation(0.2f, 1.0f).apply {
-            duration = 600
-            repeatMode = android.view.animation.Animation.REVERSE
-            repeatCount = android.view.animation.Animation.INFINITE
-        }
-        dotView.startAnimation(anim)
-        container.addView(dotView)
-
-        // 2. Elapsed Duration text
-        floatingCountTextView = android.widget.TextView(this).apply {
-            text = "00:00"
-            setTextColor(android.graphics.Color.WHITE)
-            textSize = 14f
-            setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
-            val layoutParams = android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply {
-                rightMargin = dpToPx(14)
-            }
-            this.layoutParams = layoutParams
-        }
-        container.addView(floatingCountTextView)
-
-        // 3. Spacing / Divider
-        val dividerView = android.view.View(this).apply {
-            val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(1), dpToPx(16)).apply {
-                rightMargin = dpToPx(14)
-            }
-            this.layoutParams = layoutParams
-            setBackgroundColor(android.graphics.Color.parseColor("#495057"))
-        }
-        container.addView(dividerView)
-
-        // 4. STOP Button (Action)
-        val stopBtn = android.widget.TextView(this).apply {
-            text = "STOP"
-            setTextColor(android.graphics.Color.parseColor("#FF5252")) // Modern red text
-            textSize = 13f
-            setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
-            setPadding(dpToPx(6), dpToPx(4), dpToPx(6), dpToPx(4))
-            
-            // Slight clickable indication
-            isClickable = true
-            isFocusable = true
-            
-            setOnClickListener {
-                Log.d(TAG, "Floating Stop button clicked - terminating recording.")
-                stopRecordingAndSave()
-                stopSelf()
-            }
-        }
-        container.addView(stopBtn)
-
-        // Setup WindowManager LayoutParams
+        // Setup WindowManager LayoutParams with FLAG_SECURE so it is completely excluded/hidden from video recording
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -481,7 +458,9 @@ class ScreenRecordService : Service() {
             android.view.WindowManager.LayoutParams.WRAP_CONTENT,
             android.view.WindowManager.LayoutParams.WRAP_CONTENT,
             type,
-            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    android.view.WindowManager.LayoutParams.FLAG_SECURE,
             android.graphics.PixelFormat.TRANSLUCENT
         ).apply {
             gravity = android.view.Gravity.TOP or android.view.Gravity.CENTER_HORIZONTAL
@@ -489,15 +468,20 @@ class ScreenRecordService : Service() {
             y = 200 // Position it slightly below status bar in safe zone
         }
 
-        // Add Draggability Support to container
+        // Initial rendering of internal controls
+        rebuildFloatingViews(container)
+
+        // Add Draggability and Click-to-Expand support to container
         container.setOnTouchListener(object : android.view.View.OnTouchListener {
             private var initialX = 0
             private var initialY = 0
             private var initialTouchX = 0f
             private var initialTouchY = 0f
             private var isDragging = false
+            private var startTime = 0L
 
             override fun onTouch(view: android.view.View, event: android.view.MotionEvent): Boolean {
+                resetIdleTimer() // Interactive touch events keep it expanded
                 when (event.action) {
                     android.view.MotionEvent.ACTION_DOWN -> {
                         initialX = params.x
@@ -505,6 +489,8 @@ class ScreenRecordService : Service() {
                         initialTouchX = event.rawX
                         initialTouchY = event.rawY
                         isDragging = false
+                        startTime = System.currentTimeMillis()
+                        idleHideHandler.removeCallbacks(collapseRunnable) // keep expanded during active drag
                         return true
                     }
                     android.view.MotionEvent.ACTION_MOVE -> {
@@ -519,6 +505,20 @@ class ScreenRecordService : Service() {
                         return true
                     }
                     android.view.MotionEvent.ACTION_UP -> {
+                        val clickDuration = System.currentTimeMillis() - startTime
+                        val diffX = event.rawX - initialTouchX
+                        val diffY = event.rawY - initialTouchY
+                        val isClick = clickDuration < 300 && Math.abs(diffX) < 10 && Math.abs(diffY) < 10
+
+                        if (isClick) {
+                            if (!isExpanded) {
+                                expandFloatingControls()
+                            } else {
+                                resetIdleTimer()
+                            }
+                        } else {
+                            resetIdleTimer()
+                        }
                         return true
                     }
                 }
@@ -534,7 +534,261 @@ class ScreenRecordService : Service() {
         }
     }
 
+    private fun rebuildFloatingViews(container: android.widget.LinearLayout) {
+        container.removeAllViews()
+        val isNowPaused = _recordingState.value is ServiceState.Paused
+
+        if (!isExpanded) {
+            // COLLAPSED mini pill layout (low-profile tiny status indicator)
+            container.setPadding(dpToPx(10), dpToPx(10), dpToPx(10), dpToPx(10))
+
+            val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#B31B1E21")) // High translucent midnight slate (70%)
+                cornerRadius = dpToPx(28).toFloat()
+                setStroke(dpToPx(2), android.graphics.Color.parseColor("#E0E0E0")) // High-contrast border highlight
+            }
+            container.background = backgroundDrawable
+
+            // Small indicator dot
+            val dotView = android.view.View(this).apply {
+                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(14), dpToPx(14))
+                this.layoutParams = layoutParams
+                val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(if (isNowPaused) android.graphics.Color.parseColor("#FFD600") else android.graphics.Color.RED)
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                }
+                background = dotDrawable
+            }
+            if (!isNowPaused) {
+                val anim = android.view.animation.AlphaAnimation(0.3f, 1.0f).apply {
+                    duration = 500
+                    repeatMode = android.view.animation.Animation.REVERSE
+                    repeatCount = android.view.animation.Animation.INFINITE
+                }
+                dotView.startAnimation(anim)
+            }
+            container.addView(dotView)
+
+        } else {
+            // EXPANDED dynamic dashboard studio controls
+            container.setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
+
+            val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#F21B1E21")) // Glossy midnight slate
+                cornerRadius = dpToPx(28).toFloat()
+                setStroke(dpToPx(1), android.graphics.Color.parseColor("#343A40"))
+            }
+            container.background = backgroundDrawable
+
+            // 1. Status Indicator dot
+            val dotView = android.view.View(this).apply {
+                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(10), dpToPx(10)).apply {
+                    rightMargin = dpToPx(10)
+                }
+                this.layoutParams = layoutParams
+                val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
+                    setColor(if (isNowPaused) android.graphics.Color.parseColor("#FFD600") else android.graphics.Color.RED)
+                    shape = android.graphics.drawable.GradientDrawable.OVAL
+                }
+                background = dotDrawable
+            }
+            if (!isNowPaused) {
+                val anim = android.view.animation.AlphaAnimation(0.3f, 1.0f).apply {
+                    duration = 600
+                    repeatMode = android.view.animation.Animation.REVERSE
+                    repeatCount = android.view.animation.Animation.INFINITE
+                }
+                dotView.startAnimation(anim)
+            }
+            container.addView(dotView)
+
+            // 2. Continuous dynamic timer label
+            val stateElapsedText = when (val state = _recordingState.value) {
+                is ServiceState.Active -> state.elapsedStr
+                else -> "00:00"
+            }
+
+            floatingCountTextView = android.widget.TextView(this).apply {
+                text = stateElapsedText
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 14f
+                setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+                val layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    rightMargin = dpToPx(12)
+                }
+                this.layoutParams = layoutParams
+            }
+            container.addView(floatingCountTextView)
+
+            // 3. Spacing vertical separator lines
+            val dividerView = android.view.View(this).apply {
+                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(1), dpToPx(18)).apply {
+                    rightMargin = dpToPx(12)
+                }
+                this.layoutParams = layoutParams
+                setBackgroundColor(android.graphics.Color.parseColor("#495057"))
+            }
+            container.addView(dividerView)
+
+            // 4. Grouped action button layouts
+            val btnLayout = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+            }
+
+            // Pause/Resume Button
+            val pauseResumeBtn = if (isNowPaused) {
+                createFloatActionButton("▶", "#00E676") {
+                    resumeRecording()
+                }
+            } else {
+                createFloatActionButton("⏸", "#00E676") {
+                    pauseRecording()
+                }
+            }
+            btnLayout.addView(pauseResumeBtn)
+
+            // Padding space
+            val space1 = android.view.View(this).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(8), dpToPx(1))
+            }
+            btnLayout.addView(space1)
+
+            // STOP & SAVE Button (■)
+            val saveBtn = createFloatActionButton("■", "#FF1744") {
+                stopRecordingAndSave()
+                stopSelf()
+            }
+            btnLayout.addView(saveBtn)
+
+            // Padding space
+            val space2 = android.view.View(this).apply {
+                layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(8), dpToPx(1))
+            }
+            btnLayout.addView(space2)
+
+            // Discard Button (✕)
+            val discardBtn = createFloatActionButton("✕", "#90A4AE") {
+                discardRecording()
+                stopSelf()
+            }
+            btnLayout.addView(discardBtn)
+
+            container.addView(btnLayout)
+        }
+    }
+
+    private fun createFloatActionButton(text: String, colorHex: String, onClick: () -> Unit): android.widget.TextView {
+        return android.widget.TextView(this).apply {
+            this.text = text
+            setTextColor(android.graphics.Color.parseColor(colorHex))
+            textSize = 14f
+            setPadding(dpToPx(10), dpToPx(6), dpToPx(10), dpToPx(6))
+            gravity = android.view.Gravity.CENTER
+
+            val bg = android.graphics.drawable.GradientDrawable().apply {
+                setColor(android.graphics.Color.parseColor("#2C2F33")) // Sleek grey button pill
+                cornerRadius = dpToPx(12).toFloat()
+            }
+            background = bg
+
+            isClickable = true
+            isFocusable = true
+
+            setOnClickListener {
+                resetIdleTimer()
+                onClick()
+            }
+        }
+    }
+
+    private fun updateFloatingWindowSize() {
+        val container = floatingView as? android.widget.LinearLayout ?: return
+        val params = container.layoutParams as? android.view.WindowManager.LayoutParams ?: return
+        rebuildFloatingViews(container)
+        try {
+            windowManager?.updateViewLayout(container, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating overlay layout", e)
+        }
+    }
+
+    private fun resetIdleTimer() {
+        idleHideHandler.removeCallbacks(collapseRunnable)
+        if (floatingControlsEnabled && isExpanded) {
+            idleHideHandler.postDelayed(collapseRunnable, 4000)
+        }
+    }
+
+    private fun collapseFloatingControls() {
+        if (!isExpanded) return
+        isExpanded = false
+        updateFloatingWindowSize()
+    }
+
+    private fun expandFloatingControls() {
+        if (isExpanded) return
+        isExpanded = true
+        updateFloatingWindowSize()
+        resetIdleTimer()
+    }
+
+    private fun updateFloatingControlsUI() {
+        val container = floatingView as? android.widget.LinearLayout ?: return
+        container.post {
+            updateFloatingWindowSize()
+        }
+    }
+
+    private fun pauseRecording() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                mediaRecorder?.pause()
+                timerJob?.cancel()
+
+                val currentSegmentTime = System.currentTimeMillis() - startTimestampSec
+                accumulatedDurationMs += currentSegmentTime
+
+                val totalSecs = accumulatedDurationMs / 1000
+                val minutes = totalSecs / 60
+                val seconds = totalSecs % 60
+                val elapsedStr = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+
+                _recordingState.value = ServiceState.Paused(accumulatedDurationMs, elapsedStr, currentFile?.absolutePath ?: "")
+                updateNotification(elapsedStr)
+                updateFloatingControlsUI()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to pause mediarecorder", e)
+            }
+        }
+    }
+
+    private fun resumeRecording() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            try {
+                mediaRecorder?.resume()
+                startTimestampSec = System.currentTimeMillis()
+                startTimer()
+
+                val totalSecs = accumulatedDurationMs / 1000
+                val minutes = totalSecs / 60
+                val seconds = totalSecs % 60
+                val elapsedStr = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+
+                _recordingState.value = ServiceState.Recording(accumulatedDurationMs, elapsedStr, currentFile?.absolutePath ?: "")
+                updateNotification(elapsedStr)
+                updateFloatingControlsUI()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resume mediarecorder", e)
+            }
+        }
+    }
+
     private fun hideFloatingControls() {
+        idleHideHandler.removeCallbacks(collapseRunnable)
         if (floatingView != null && windowManager != null) {
             try {
                 windowManager?.removeView(floatingView)
@@ -570,7 +824,13 @@ class ScreenRecordService : Service() {
 
     sealed class ServiceState {
         object Idle : ServiceState()
-        data class Recording(val durationMs: Long, val elapsedStr: String, val filePath: String) : ServiceState()
+        interface Active {
+            val durationMs: Long
+            val elapsedStr: String
+            val filePath: String
+        }
+        data class Recording(override val durationMs: Long, override val elapsedStr: String, override val filePath: String) : ServiceState(), Active
+        data class Paused(override val durationMs: Long, override val elapsedStr: String, override val filePath: String) : ServiceState(), Active
         data class Error(val message: String) : ServiceState()
     }
 
@@ -581,6 +841,8 @@ class ScreenRecordService : Service() {
 
         const val ACTION_STOP = "com.example.service.STOP"
         const val ACTION_DISCARD = "com.example.service.DISCARD"
+        const val ACTION_PAUSE = "com.example.service.PAUSE"
+        const val ACTION_RESUME = "com.example.service.RESUME"
         
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_RESULT_DATA = "result_data"

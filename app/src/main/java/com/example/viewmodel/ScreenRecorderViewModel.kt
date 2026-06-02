@@ -1,6 +1,7 @@
 package com.example.viewmodel
 
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -121,6 +122,20 @@ class ScreenRecorderViewModel(private val repository: RecordingRepository) : Vie
 
     fun stopScreenRecorder(context: Context) {
         ScreenRecordService.stop(context)
+    }
+
+    fun pauseScreenRecorder(context: Context) {
+        val intent = Intent(context, ScreenRecordService::class.java).apply {
+            action = ScreenRecordService.ACTION_PAUSE
+        }
+        context.startService(intent)
+    }
+
+    fun resumeScreenRecorder(context: Context) {
+        val intent = Intent(context, ScreenRecordService::class.java).apply {
+            action = ScreenRecordService.ACTION_RESUME
+        }
+        context.startService(intent)
     }
 
     fun deleteRecording(recording: Recording) {

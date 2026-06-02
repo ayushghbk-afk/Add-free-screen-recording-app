@@ -146,7 +146,7 @@ fun ScreenRecorderMainScreen(
                     .padding(horizontal = 24.dp, vertical = 16.dp),
                 contentAlignment = Alignment.Center
             ) {
-                val isRecording = activeState is ScreenRecordService.ServiceState.Recording
+                val isRecording = activeState is ScreenRecordService.ServiceState.Active
                 
                 Button(
                     onClick = {
@@ -223,17 +223,26 @@ fun ScreenRecorderMainScreen(
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Live Status Banner if recording
+            // Live Status Banner if recording or paused
             item {
                 AnimatedVisibility(
-                    visible = activeState is ScreenRecordService.ServiceState.Recording,
+                    visible = activeState is ScreenRecordService.ServiceState.Active,
                     enter = fadeIn() + expandVertically(),
                     exit = fadeOut() + shrinkVertically()
                 ) {
-                    val recordingInfo = activeState as? ScreenRecordService.ServiceState.Recording
+                    val recordingInfo = activeState as? ScreenRecordService.ServiceState.Active
+                    val isPaused = activeState is ScreenRecordService.ServiceState.Paused
                     RecordingStatusCard(
                         elapsedStr = recordingInfo?.elapsedStr ?: "00:00",
                         settingsStr = "${selectedPreset.label} @ ${selectedFps}FPS",
+                        isPaused = isPaused,
+                        onPauseToggleClick = {
+                            if (isPaused) {
+                                viewModel.resumeScreenRecorder(context)
+                            } else {
+                                viewModel.pauseScreenRecorder(context)
+                            }
+                        },
                         onStopClick = { viewModel.stopScreenRecorder(context) }
                     )
                 }
@@ -242,7 +251,7 @@ fun ScreenRecorderMainScreen(
             // Options Configurations Cards (Only visible if not actively recording)
             item {
                 AnimatedVisibility(
-                    visible = activeState !is ScreenRecordService.ServiceState.Recording,
+                    visible = activeState !is ScreenRecordService.ServiceState.Active,
                     enter = fadeIn() + expandVertically(),
                     exit = fadeOut() + shrinkVertically()
                 ) {
@@ -427,6 +436,8 @@ fun ScreenRecorderMainScreen(
 fun RecordingStatusCard(
     elapsedStr: String,
     settingsStr: String,
+    isPaused: Boolean,
+    onPauseToggleClick: () -> Unit,
     onStopClick: () -> Unit
 ) {
     Card(
@@ -435,12 +446,23 @@ fun RecordingStatusCard(
             .testTag("active_status_card"),
         shape = RoundedCornerShape(24.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f),
-            contentColor = MaterialTheme.colorScheme.onErrorContainer
+            containerColor = if (isPaused) {
+                MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.85f)
+            } else {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.85f)
+            },
+            contentColor = if (isPaused) {
+                MaterialTheme.colorScheme.onTertiaryContainer
+            } else {
+                MaterialTheme.colorScheme.onErrorContainer
+            }
         ),
         border = CardDefaults.outlinedCardBorder().copy(
             brush = Brush.horizontalGradient(
-                listOf(MaterialTheme.colorScheme.error, MaterialTheme.colorScheme.primary)
+                listOf(
+                    if (isPaused) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error,
+                    MaterialTheme.colorScheme.primary
+                )
             )
         )
     ) {
@@ -457,14 +479,24 @@ fun RecordingStatusCard(
                         modifier = Modifier
                             .size(10.dp)
                             .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.error)
+                            .background(
+                                if (isPaused) {
+                                    MaterialTheme.colorScheme.tertiary
+                                } else {
+                                    MaterialTheme.colorScheme.error
+                                }
+                            )
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "RECORDING BACKGROUND",
+                        text = if (isPaused) "RECORDING PAUSED" else "RECORDING BACKGROUND",
                         style = MaterialTheme.typography.labelSmall.copy(
                             fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.error
+                            color = if (isPaused) {
+                                MaterialTheme.colorScheme.tertiary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            }
                         )
                     )
                 }
@@ -484,19 +516,44 @@ fun RecordingStatusCard(
                 )
             }
 
-            IconButton(
-                onClick = onStopClick,
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.error),
-                colors = IconButtonDefaults.iconButtonColors(contentColor = Color.White)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Stop,
-                    contentDescription = "Stop Recording",
-                    modifier = Modifier.size(28.dp)
-                )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = onPauseToggleClick,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (isPaused) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant
+                            }
+                        ),
+                    colors = IconButtonDefaults.iconButtonColors(
+                        contentColor = if (isPaused) Color.White else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                ) {
+                    Icon(
+                        imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        contentDescription = if (isPaused) "Resume Recording" else "Pause Recording",
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(
+                    onClick = onStopClick,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.error),
+                    colors = IconButtonDefaults.iconButtonColors(contentColor = Color.White)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Stop,
+                        contentDescription = "Stop Recording",
+                        modifier = Modifier.size(24.dp)
+                    )
+                }
             }
         }
     }
