@@ -65,8 +65,8 @@ fun ScreenRecorderMainScreen(
     val audioEnabled by viewModel.audioEnabled.collectAsStateWithLifecycle()
     val floatingControlsEnabled by viewModel.floatingControlsEnabled.collectAsStateWithLifecycle()
     val trimState by viewModel.trimState.collectAsStateWithLifecycle()
-
-    var recordingToTrim by remember { mutableStateOf<Recording?>(null) }
+    
+    var activeStudioRecording by remember { mutableStateOf<Recording?>(null) }
     var recordingToDelete by remember { mutableStateOf<Recording?>(null) }
 
     // Projections management
@@ -312,7 +312,7 @@ fun ScreenRecorderMainScreen(
             }
 
             // Empty state placeholder
-            if (recordings.isEmpty()) {
+             if (recordings.isEmpty()) {
                 item {
                     EmptyHistoryPlaceholder()
                 }
@@ -320,23 +320,28 @@ fun ScreenRecorderMainScreen(
                 items(recordings, key = { it.id }) { item ->
                     RecordingGalleryItem(
                         recording = item,
-                        onPlayClick = { playVideoFile(context, item) },
+                        onPlayClick = { activeStudioRecording = item },
                         onShareClick = { shareVideoFile(context, item) },
-                        onTrimClick = { recordingToTrim = item },
+                        onTrimClick = { activeStudioRecording = item },
                         onDeleteClick = { recordingToDelete = item }
                     )
                 }
             }
         }
 
-        // Dialog for Trimming
-        recordingToTrim?.let { recording ->
-            TrimDialog(
+        // Unified Production Studio level Video Player and Trimming system
+        activeStudioRecording?.let { recording ->
+            StudioPlayerAndEditorDialog(
                 recording = recording,
-                onDismiss = { recordingToTrim = null },
+                onDismiss = { activeStudioRecording = null },
                 onTrimExecute = { start, end ->
                     viewModel.trimRecording(recording, start, end)
-                    recordingToTrim = null
+                    activeStudioRecording = null
+                },
+                onShareClick = { shareVideoFile(context, recording) },
+                onDeleteClick = {
+                    recordingToDelete = recording
+                    activeStudioRecording = null
                 }
             )
         }
