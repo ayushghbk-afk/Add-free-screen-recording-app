@@ -441,22 +441,14 @@ class ScreenRecordService : Service() {
         return (dp * resources.displayMetrics.density).toInt()
     }
 
-    private fun togglePenDrawing() {
-        isPenActive = !isPenActive
-        if (isPenActive) {
-            isPenInteractClickThrough = false
-            showDrawingCanvas()
-        } else {
-            hideDrawingCanvas()
-        }
-        updateFloatingControlsUI()
-    }
-
-    private fun showDrawingCanvas() {
+    private fun initializeDrawingCanvas() {
         if (drawingCanvasView != null) return
+        windowManager = windowManager ?: (getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager)
+        
         val canvas = DrawingCanvasView(this).apply {
             activeColor = penColor
             activeStrokeWidth = penWidth
+            visibility = android.view.View.GONE
         }
         drawingCanvasView = canvas
 
@@ -472,6 +464,7 @@ class ScreenRecordService : Service() {
             android.view.WindowManager.LayoutParams.MATCH_PARENT,
             type,
             android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
                     android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                     android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             android.graphics.PixelFormat.TRANSLUCENT
@@ -480,8 +473,76 @@ class ScreenRecordService : Service() {
         try {
             windowManager?.addView(canvas, params)
         } catch (e: Exception) {
-            Log.e(TAG, "Error adding drawing canvas", e)
+            Log.e(TAG, "Error initializing drawing canvas", e)
         }
+    }
+
+    private fun updateDrawingCanvasState() {
+        val canvas = drawingCanvasView ?: return
+        val wm = windowManager ?: return
+        
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            android.view.WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        if (isPenActive) {
+            canvas.visibility = android.view.View.VISIBLE
+            
+            val flags = if (isPenInteractClickThrough) {
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            } else {
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+            }
+
+            val params = android.view.WindowManager.LayoutParams(
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                type,
+                flags,
+                android.graphics.PixelFormat.TRANSLUCENT
+            )
+            try {
+                wm.updateViewLayout(canvas, params)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating draw canvas params", e)
+            }
+        } else {
+            canvas.visibility = android.view.View.GONE
+            canvas.clearCanvas()
+            
+            val params = android.view.WindowManager.LayoutParams(
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                android.view.WindowManager.LayoutParams.MATCH_PARENT,
+                type,
+                android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                        android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                android.graphics.PixelFormat.TRANSLUCENT
+            )
+            try {
+                wm.updateViewLayout(canvas, params)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating draw canvas params to hidden", e)
+            }
+        }
+    }
+
+    private fun togglePenDrawing() {
+        isPenActive = !isPenActive
+        if (isPenActive) {
+            isPenInteractClickThrough = false
+        }
+        updateDrawingCanvasState()
+        updateFloatingControlsUI()
     }
 
     private fun hideDrawingCanvas() {
@@ -496,40 +557,8 @@ class ScreenRecordService : Service() {
     }
 
     private fun togglePenTouchThrough() {
-        val canvas = drawingCanvasView ?: return
         isPenInteractClickThrough = !isPenInteractClickThrough
-        
-        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        } else {
-            @Suppress("DEPRECATION")
-            android.view.WindowManager.LayoutParams.TYPE_PHONE
-        }
-
-        val flags = if (isPenInteractClickThrough) {
-            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-        } else {
-            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-        }
-
-        val params = android.view.WindowManager.LayoutParams(
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            android.view.WindowManager.LayoutParams.MATCH_PARENT,
-            type,
-            flags,
-            android.graphics.PixelFormat.TRANSLUCENT
-        )
-
-        try {
-            windowManager?.updateViewLayout(canvas, params)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error updating draw canvas params", e)
-        }
+        updateDrawingCanvasState()
         updateFloatingControlsUI()
     }
 
@@ -627,6 +656,9 @@ class ScreenRecordService : Service() {
         }
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as android.view.WindowManager
+
+        // Initialize drawing canvas first, placing it below floatingView in Z-order
+        initializeDrawingCanvas()
 
         // Create main container view (LinearLayout)
         val container = android.widget.LinearLayout(this).apply {
