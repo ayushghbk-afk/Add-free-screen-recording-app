@@ -61,6 +61,13 @@ class ScreenRecordService : Service() {
         collapseFloatingControls()
     }
 
+    // Pen overlay fields
+    private var isPenActive = false
+    private var drawingCanvasView: DrawingCanvasView? = null
+    private var penColor = android.graphics.Color.RED
+    private var penWidth = 10f
+    private var isPenInteractClickThrough = false
+
     override fun onCreate() {
         super.onCreate()
         mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
@@ -244,6 +251,7 @@ class ScreenRecordService : Service() {
 
     private fun stopRecordingAndSave() {
         timerJob?.cancel()
+        hideDrawingCanvas()
         hideFloatingControls()
         
         val recordTime = if (_recordingState.value is ServiceState.Paused) {
@@ -422,6 +430,7 @@ class ScreenRecordService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        hideDrawingCanvas()
         hideFloatingControls()
         serviceJob.cancel()
     }
@@ -430,6 +439,185 @@ class ScreenRecordService : Service() {
 
     private fun dpToPx(dp: Int): Int {
         return (dp * resources.displayMetrics.density).toInt()
+    }
+
+    private fun togglePenDrawing() {
+        isPenActive = !isPenActive
+        if (isPenActive) {
+            isPenInteractClickThrough = false
+            showDrawingCanvas()
+        } else {
+            hideDrawingCanvas()
+        }
+        updateFloatingControlsUI()
+    }
+
+    private fun showDrawingCanvas() {
+        if (drawingCanvasView != null) return
+        val canvas = DrawingCanvasView(this).apply {
+            activeColor = penColor
+            activeStrokeWidth = penWidth
+        }
+        drawingCanvasView = canvas
+
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            android.view.WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val params = android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            type,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+
+        try {
+            windowManager?.addView(canvas, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error adding drawing canvas", e)
+        }
+    }
+
+    private fun hideDrawingCanvas() {
+        drawingCanvasView?.let {
+            try {
+                windowManager?.removeView(it)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error removing drawing canvas", e)
+            }
+        }
+        drawingCanvasView = null
+    }
+
+    private fun togglePenTouchThrough() {
+        val canvas = drawingCanvasView ?: return
+        isPenInteractClickThrough = !isPenInteractClickThrough
+        
+        val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            android.view.WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        } else {
+            @Suppress("DEPRECATION")
+            android.view.WindowManager.LayoutParams.TYPE_PHONE
+        }
+
+        val flags = if (isPenInteractClickThrough) {
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        } else {
+            android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        }
+
+        val params = android.view.WindowManager.LayoutParams(
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            android.view.WindowManager.LayoutParams.MATCH_PARENT,
+            type,
+            flags,
+            android.graphics.PixelFormat.TRANSLUCENT
+        )
+
+        try {
+            windowManager?.updateViewLayout(canvas, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating draw canvas params", e)
+        }
+        updateFloatingControlsUI()
+    }
+
+    private fun stopRecordingAndExport() {
+        timerJob?.cancel()
+        hideDrawingCanvas()
+        hideFloatingControls()
+        
+        val recordTime = if (_recordingState.value is ServiceState.Paused) {
+            accumulatedDurationMs
+        } else {
+            accumulatedDurationMs + (System.currentTimeMillis() - startTimestampSec)
+        }
+        durationMs = if (recordTime > 0) recordTime else 0
+
+        try {
+            mediaRecorder?.stop()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping mediaRecorder during export", e)
+            currentFile?.delete()
+            currentFile = null
+        } finally {
+            mediaRecorder?.release()
+            mediaRecorder = null
+        }
+
+        virtualDisplay?.release()
+        virtualDisplay = null
+
+        mediaProjection?.stop()
+        mediaProjection = null
+
+        val finalFile = currentFile
+        if (finalFile != null && finalFile.exists() && finalFile.length() > 0) {
+            val size = finalFile.length()
+            val path = finalFile.absolutePath
+            val title = finalFile.nameWithoutExtension
+
+            serviceScope.launch(Dispatchers.IO) {
+                val db = RecordingDatabase.getDatabase(applicationContext)
+                db.recordingDao().insertRecording(
+                    Recording(
+                        title = title,
+                        filePath = path,
+                        timestamp = System.currentTimeMillis(),
+                        durationMs = durationMs,
+                        fileSize = size,
+                        width = targetWidth,
+                        height = targetHeight,
+                        bitrate = bitrate,
+                        fps = fps,
+                        isTrimmed = false
+                    )
+                )
+                withContext(Dispatchers.Main) {
+                    _recordingState.value = ServiceState.Idle
+                    
+                    try {
+                        val uri = androidx.core.content.FileProvider.getUriForFile(
+                            applicationContext,
+                            "$packageName.fileprovider",
+                            finalFile
+                        )
+                        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                            type = "video/mp4"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        val chooserIntent = Intent.createChooser(sendIntent, "Export Media File").apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        startActivity(chooserIntent)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error launching export menu", e)
+                    }
+                }
+            }
+        } else {
+            _recordingState.value = ServiceState.Idle
+        }
+    }
+
+    private fun addSpacing(layout: android.widget.LinearLayout, dp: Int) {
+        val spacer = android.view.View(this).apply {
+            layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(dp), dpToPx(1))
+        }
+        layout.addView(spacer)
     }
 
     private fun showFloatingControls() {
@@ -442,8 +630,8 @@ class ScreenRecordService : Service() {
 
         // Create main container view (LinearLayout)
         val container = android.widget.LinearLayout(this).apply {
-            orientation = android.widget.LinearLayout.HORIZONTAL
-            gravity = android.view.Gravity.CENTER_VERTICAL
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
         }
 
         // Setup WindowManager LayoutParams with FLAG_SECURE so it is completely excluded/hidden from video recording
@@ -540,18 +728,23 @@ class ScreenRecordService : Service() {
 
         if (!isExpanded) {
             // COLLAPSED mini pill layout (low-profile tiny status indicator)
-            container.setPadding(dpToPx(10), dpToPx(10), dpToPx(10), dpToPx(10))
+            container.setPadding(dpToPx(12), dpToPx(8), dpToPx(12), dpToPx(8))
 
             val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
                 setColor(android.graphics.Color.parseColor("#B31B1E21")) // High translucent midnight slate (70%)
                 cornerRadius = dpToPx(28).toFloat()
-                setStroke(dpToPx(2), android.graphics.Color.parseColor("#E0E0E0")) // High-contrast border highlight
+                setStroke(dpToPx(2), android.graphics.Color.parseColor("#00E676")) // Vibrant border accent
             }
             container.background = backgroundDrawable
 
+            val row = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+            }
+
             // Small indicator dot
             val dotView = android.view.View(this).apply {
-                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(14), dpToPx(14))
+                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(10), dpToPx(10))
                 this.layoutParams = layoutParams
                 val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
                     setColor(if (isNowPaused) android.graphics.Color.parseColor("#FFD600") else android.graphics.Color.RED)
@@ -567,23 +760,55 @@ class ScreenRecordService : Service() {
                 }
                 dotView.startAnimation(anim)
             }
-            container.addView(dotView)
+            row.addView(dotView)
+
+            // Live Timer displayed in collapsed view
+            val collapsedTime = when (val state = _recordingState.value) {
+                is ServiceState.Active -> state.elapsedStr
+                else -> "00:00"
+            }
+            val tinyTimeText = android.widget.TextView(this).apply {
+                text = collapsedTime
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 10f
+                setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+                val layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    leftMargin = dpToPx(6)
+                }
+                this.layoutParams = layoutParams
+            }
+            row.addView(tinyTimeText)
+
+            container.addView(row)
 
         } else {
             // EXPANDED dynamic dashboard studio controls
-            container.setPadding(dpToPx(16), dpToPx(8), dpToPx(16), dpToPx(8))
+            container.setPadding(dpToPx(14), dpToPx(8), dpToPx(14), dpToPx(8))
 
             val backgroundDrawable = android.graphics.drawable.GradientDrawable().apply {
-                setColor(android.graphics.Color.parseColor("#F21B1E21")) // Glossy midnight slate
-                cornerRadius = dpToPx(28).toFloat()
-                setStroke(dpToPx(1), android.graphics.Color.parseColor("#343A40"))
+                setColor(android.graphics.Color.parseColor("#EE1B1E21")) // Glossy dark card slate
+                cornerRadius = dpToPx(24).toFloat()
+                setStroke(dpToPx(1), android.graphics.Color.parseColor("#495057"))
             }
             container.background = backgroundDrawable
+
+            // Row 1: Primary Control Elements
+            val row1 = android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.HORIZONTAL
+                gravity = android.view.Gravity.CENTER_VERTICAL
+                layoutParams = android.widget.LinearLayout.LayoutParams(
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                    android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                )
+            }
 
             // 1. Status Indicator dot
             val dotView = android.view.View(this).apply {
                 val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(10), dpToPx(10)).apply {
-                    rightMargin = dpToPx(10)
+                    rightMargin = dpToPx(8)
                 }
                 this.layoutParams = layoutParams
                 val dotDrawable = android.graphics.drawable.GradientDrawable().apply {
@@ -600,7 +825,7 @@ class ScreenRecordService : Service() {
                 }
                 dotView.startAnimation(anim)
             }
-            container.addView(dotView)
+            row1.addView(dotView)
 
             // 2. Continuous dynamic timer label
             val stateElapsedText = when (val state = _recordingState.value) {
@@ -611,29 +836,29 @@ class ScreenRecordService : Service() {
             floatingCountTextView = android.widget.TextView(this).apply {
                 text = stateElapsedText
                 setTextColor(android.graphics.Color.WHITE)
-                textSize = 14f
+                textSize = 13f
                 setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
                 val layoutParams = android.widget.LinearLayout.LayoutParams(
                     android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
                     android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    rightMargin = dpToPx(12)
+                    rightMargin = dpToPx(10)
                 }
                 this.layoutParams = layoutParams
             }
-            container.addView(floatingCountTextView)
+            row1.addView(floatingCountTextView)
 
             // 3. Spacing vertical separator lines
             val dividerView = android.view.View(this).apply {
-                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(1), dpToPx(18)).apply {
-                    rightMargin = dpToPx(12)
+                val layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(1), dpToPx(16)).apply {
+                    rightMargin = dpToPx(10)
                 }
                 this.layoutParams = layoutParams
                 setBackgroundColor(android.graphics.Color.parseColor("#495057"))
             }
-            container.addView(dividerView)
+            row1.addView(dividerView)
 
-            // 4. Grouped action button layouts
+            // 4. Grouped action buttons
             val btnLayout = android.widget.LinearLayout(this).apply {
                 orientation = android.widget.LinearLayout.HORIZONTAL
                 gravity = android.view.Gravity.CENTER_VERTICAL
@@ -645,17 +870,12 @@ class ScreenRecordService : Service() {
                     resumeRecording()
                 }
             } else {
-                createFloatActionButton("⏸", "#00E676") {
+                createFloatActionButton("⏸", "#29B6F6") {
                     pauseRecording()
                 }
             }
             btnLayout.addView(pauseResumeBtn)
-
-            // Padding space
-            val space1 = android.view.View(this).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(8), dpToPx(1))
-            }
-            btnLayout.addView(space1)
+            addSpacing(btnLayout, 6)
 
             // STOP & SAVE Button (■)
             val saveBtn = createFloatActionButton("■", "#FF1744") {
@@ -663,21 +883,139 @@ class ScreenRecordService : Service() {
                 stopSelf()
             }
             btnLayout.addView(saveBtn)
+            addSpacing(btnLayout, 6)
 
-            // Padding space
-            val space2 = android.view.View(this).apply {
-                layoutParams = android.widget.LinearLayout.LayoutParams(dpToPx(8), dpToPx(1))
+            // EXPORT & SHARE (📤)
+            val exportBtn = createFloatActionButton("📤", "#FF9100") {
+                stopRecordingAndExport()
+                stopSelf()
             }
-            btnLayout.addView(space2)
+            btnLayout.addView(exportBtn)
+            addSpacing(btnLayout, 6)
+
+            // PEN/ANNOTATION TOOL (✏️)
+            val penBtnColor = if (isPenActive) "#E040FB" else "#90A4AE"
+            val penBtn = createFloatActionButton("✏️", penBtnColor) {
+                togglePenDrawing()
+            }
+            btnLayout.addView(penBtn)
+            addSpacing(btnLayout, 6)
 
             // Discard Button (✕)
-            val discardBtn = createFloatActionButton("✕", "#90A4AE") {
+            val discardBtn = createFloatActionButton("✕", "#757575") {
                 discardRecording()
                 stopSelf()
             }
             btnLayout.addView(discardBtn)
+            addSpacing(btnLayout, 6)
 
-            container.addView(btnLayout)
+            // Collapse Button (➖)
+            val collapseBtn = createFloatActionButton("➖", "#ECEFF1") {
+                collapseFloatingControls()
+            }
+            btnLayout.addView(collapseBtn)
+
+            row1.addView(btnLayout)
+            container.addView(row1)
+
+            // Row 2: Pen Tools Draw Suite (visible ONLY if pen drawing mode is active)
+            if (isPenActive) {
+                // Divider horizontal line
+                val penDivider = android.view.View(this).apply {
+                    val layoutParams = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                        dpToPx(1)
+                    ).apply {
+                        topMargin = dpToPx(8)
+                        bottomMargin = dpToPx(8)
+                    }
+                    this.layoutParams = layoutParams
+                    setBackgroundColor(android.graphics.Color.parseColor("#424242"))
+                }
+                container.addView(penDivider)
+
+                val row2 = android.widget.LinearLayout(this).apply {
+                    orientation = android.widget.LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    layoutParams = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                    )
+                }
+
+                // Title Label
+                val penLabel = android.widget.TextView(this).apply {
+                    text = "DRAW:"
+                    setTextColor(android.graphics.Color.parseColor("#E040FB"))
+                    textSize = 10f
+                    setTypeface(android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+                    val layoutParams = android.widget.LinearLayout.LayoutParams(
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT,
+                        android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        rightMargin = dpToPx(8)
+                    }
+                    this.layoutParams = layoutParams
+                }
+                row2.addView(penLabel)
+
+                // Color selectors
+                val colors = listOf(
+                    android.graphics.Color.RED to "🔴",
+                    android.graphics.Color.GREEN to "🟢",
+                    android.graphics.Color.BLUE to "🔵",
+                    android.graphics.Color.YELLOW to "🟡",
+                    android.graphics.Color.WHITE to "⚪"
+                )
+
+                for ((color, symbol) in colors) {
+                    val isColorSelected = penColor == color
+                    val chipBtn = android.widget.TextView(this).apply {
+                        text = symbol
+                        textSize = 13f
+                        setPadding(dpToPx(4), dpToPx(2), dpToPx(4), dpToPx(2))
+                        gravity = android.view.Gravity.CENTER
+                        
+                        val bg = android.graphics.drawable.GradientDrawable().apply {
+                            setColor(if (isColorSelected) android.graphics.Color.parseColor("#424242") else android.graphics.Color.TRANSPARENT)
+                            cornerRadius = dpToPx(8).toFloat()
+                            if (isColorSelected) {
+                                setStroke(dpToPx(1), android.graphics.Color.parseColor("#E040FB"))
+                            }
+                        }
+                        background = bg
+                        
+                        setOnClickListener {
+                            penColor = color
+                            drawingCanvasView?.activeColor = color
+                            updateFloatingControlsUI()
+                        }
+                    }
+                    row2.addView(chipBtn)
+                    addSpacing(row2, 4)
+                }
+
+                // Canvas Eraser / Sweep button (🧹)
+                val clearBtn = createFloatActionButton("🧹 Clear", "#E040FB") {
+                    drawingCanvasView?.clearCanvas()
+                }
+                row2.addView(clearBtn)
+                addSpacing(row2, 6)
+
+                // Draw / Clickunder Toggle
+                val statusText = if (isPenInteractClickThrough) {
+                    "👆 Clickable"
+                } else {
+                    "✍️ Draw Mode"
+                }
+                val modeBtnColor = if (isPenInteractClickThrough) "#FFB300" else "#29B6F6"
+                val interactToggleBtn = createFloatActionButton(statusText, modeBtnColor) {
+                    togglePenTouchThrough()
+                }
+                row2.addView(interactToggleBtn)
+
+                container.addView(row2)
+            }
         }
     }
 
@@ -685,7 +1023,7 @@ class ScreenRecordService : Service() {
         return android.widget.TextView(this).apply {
             this.text = text
             setTextColor(android.graphics.Color.parseColor(colorHex))
-            textSize = 14f
+            textSize = 13f
             setPadding(dpToPx(10), dpToPx(6), dpToPx(10), dpToPx(6))
             gravity = android.view.Gravity.CENTER
 
@@ -803,6 +1141,7 @@ class ScreenRecordService : Service() {
 
     private fun discardRecording() {
         timerJob?.cancel()
+        hideDrawingCanvas()
         hideFloatingControls()
         try {
             mediaRecorder?.stop()
@@ -895,5 +1234,76 @@ class ScreenRecordService : Service() {
                 _recordingState.value = ServiceState.Idle
             }
         }
+    }
+}
+
+data class ColoredPath(val path: android.graphics.Path, val color: Int, val strokeWidth: Float)
+
+class DrawingCanvasView(context: Context) : android.view.View(context) {
+    private val paths = java.util.ArrayList<ColoredPath>()
+    private var currentPath = android.graphics.Path()
+    
+    var activeColor = android.graphics.Color.RED
+    var activeStrokeWidth = 10f
+
+    fun clearCanvas() {
+        paths.clear()
+        currentPath.reset()
+        invalidate()
+    }
+
+    override fun onDraw(canvas: android.graphics.Canvas) {
+        super.onDraw(canvas)
+        
+        // Draw historic paths
+        for (coloredPath in paths) {
+            val paint = android.graphics.Paint().apply {
+                color = coloredPath.color
+                isAntiAlias = true
+                strokeWidth = coloredPath.strokeWidth
+                style = android.graphics.Paint.Style.STROKE
+                strokeJoin = android.graphics.Paint.Join.ROUND
+                strokeCap = android.graphics.Paint.Cap.ROUND
+            }
+            canvas.drawPath(coloredPath.path, paint)
+        }
+        
+        // Draw active path
+        val currentPaint = android.graphics.Paint().apply {
+            color = activeColor
+            isAntiAlias = true
+            strokeWidth = activeStrokeWidth
+            style = android.graphics.Paint.Style.STROKE
+            strokeJoin = android.graphics.Paint.Join.ROUND
+            strokeCap = android.graphics.Paint.Cap.ROUND
+        }
+        canvas.drawPath(currentPath, currentPaint)
+    }
+
+    override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+        val x = event.x
+        val y = event.y
+
+        when (event.action) {
+            android.view.MotionEvent.ACTION_DOWN -> {
+                currentPath = android.graphics.Path()
+                currentPath.moveTo(x, y)
+                invalidate()
+                return true
+            }
+            android.view.MotionEvent.ACTION_MOVE -> {
+                currentPath.lineTo(x, y)
+                invalidate()
+                return true
+            }
+            android.view.MotionEvent.ACTION_UP -> {
+                currentPath.lineTo(x, y)
+                paths.add(ColoredPath(currentPath, activeColor, activeStrokeWidth))
+                currentPath = android.graphics.Path() // reset reference
+                invalidate()
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
     }
 }
