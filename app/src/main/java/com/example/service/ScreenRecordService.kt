@@ -96,21 +96,7 @@ class ScreenRecordService : Service() {
             return START_NOT_STICKY
         }
 
-        // 1. Immediately post notification and go foreground (Android requirement)
-        createNotificationChannel()
-        val notification = createNotification("00:00")
-        
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID, 
-                notification, 
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-
-        // 2. Set recording configuration
+        // 1. Unpack recording configuration and settings (such as audioEnabled) before going foreground
         val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
         val resultData = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
         
@@ -121,6 +107,24 @@ class ScreenRecordService : Service() {
         audioEnabled = intent.getBooleanExtra(EXTRA_AUDIO, true)
         dpi = intent.getIntExtra(EXTRA_DPI, 240)
         floatingControlsEnabled = intent.getBooleanExtra(EXTRA_FLOATING_CONTROLS, false)
+
+        // 2. Immediately post notification and go foreground (Android requirement)
+        createNotificationChannel()
+        val notification = createNotification("00:00")
+        
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            var serviceType = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            if (audioEnabled) {
+                serviceType = serviceType or android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            startForeground(
+                NOTIFICATION_ID, 
+                notification, 
+                serviceType
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
 
         if (resultCode != Activity.RESULT_OK || resultData == null) {
             Log.e(TAG, "Invalid result code or null intent data. Stopping service.")
